@@ -1,0 +1,126 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Auth Demo Web</title>
+    <meta
+        name="description"
+        content="Static website sample for passkey registration, authentication, and calling /me against the Swift auth service."
+    >
+    <link rel="stylesheet" href="./styles.css">
+</head>
+<body>
+    <main class="shell">
+        <section class="hero panel">
+            <p class="eyebrow">Static Passkey Sample</p>
+            <p class="lede">
+                Create a passkey, authenticate with it, and call <code>/me</code> from a static site.
+            </p>
+
+            <div class="hero-grid">
+                <div class="hero-card">
+                    <span class="hero-label">Frontend origin</span>
+                    <strong id="frontend-origin">Checking...</strong>
+                </div>
+                <div class="hero-card">
+                    <span class="hero-label">Browser support</span>
+                    <strong id="support-summary">Checking...</strong>
+                </div>
+            </div>
+        </section>
+
+        <section class="workspace">
+            <section class="panel">
+                <div class="section-heading">
+                    <div>
+                        <p class="eyebrow">Configuration</p>
+                        <h2>Point the app at your auth service.</h2>
+                    </div>
+                </div>
+
+                <form id="auth-form" class="stack" novalidate>
+                    <label class="field">
+                        <span>Service base URL</span>
+                        <input
+                            id="api-base-url"
+                            name="api-base-url"
+                            type="url"
+                            inputmode="url"
+                            autocomplete="url"
+                            spellcheck="false"
+                            placeholder="https://auth.example.com"
+                        >
+                    </label>
+
+                    <label class="field">
+                        <span>Username</span>
+                        <input
+                            id="username"
+                            name="username"
+                            type="email"
+                            autocomplete="username webauthn"
+                            autocapitalize="off"
+                            spellcheck="false"
+                            placeholder="demo@example.com"
+                        >
+                    </label>
+
+                    <p class="hint">
+                        Serve this page from the exact origin configured as <code>RP_ORIGIN</code>. Set <code>RP_ID</code> to this page's hostname, or to a shared parent domain only if you intentionally want passkeys to work across subdomains.
+                    </p>
+
+                    <div class="actions">
+                        <button id="register-button" type="button">Create Passkey</button>
+                        <button id="authenticate-button" type="button">Authenticate</button>
+                        <button id="me-button" type="button">Load /me</button>
+                        <button id="reset-button" class="secondary" type="button">Reset Session</button>
+                    </div>
+                </form>
+            </section>
+
+            <section class="panel output-panel">
+                <div class="section-heading">
+                    <div>
+                        <p class="eyebrow">Session</p>
+                        <h2>JWT</h2>
+                    </div>
+                    <span class="pill" id="token-state">No token</span>
+                </div>
+                <pre id="token-output" class="code-block empty">Authenticate to mint an access token.</pre>
+            </section>
+
+            <section class="panel output-panel">
+                <div class="section-heading">
+                    <div>
+                        <p class="eyebrow">Protected API</p>
+                        <h2>/me response</h2>
+                    </div>
+                </div>
+                <pre id="profile-output" class="code-block empty">Call /me after authenticating.</pre>
+            </section>
+
+            <section class="panel output-panel">
+                <div class="section-heading">
+                    <div>
+                        <p class="eyebrow">Status</p>
+                        <h2>Recent activity</h2>
+                    </div>
+                    <span class="pill" id="busy-indicator">Ready</span>
+                </div>
+                <ol id="status-log" class="status-log"></ol>
+            </section>
+        </section>
+
+        <section class="hero panel diagnostics-panel">
+            <ul class="diagnostics" id="diagnostics"></ul>
+        </section>
+    </main>
+
+    <noscript>
+        <p class="noscript">JavaScript is required to use the passkey demo.</p>
+    </noscript>
+
+    <script type="module" src="./app.js"></script>
+</body>
+</html>
