@@ -58,6 +58,8 @@ Authorization transactions last 5 minutes, codes 60 seconds, access and ID token
 
 Native clients request `offline_access` along with `openid profile` and authorize that access on the hosted page. Refresh with form fields `grant_type=refresh_token`, `client_id`, and `refresh_token`. Each success replaces the refresh token; store it securely and serialize refreshes. The session ends 30 days after initial code redemption; rotation does not extend it. Refreshed ID tokens preserve `auth_time`, omit nonce and must match the existing subject.
 
+`OIDCClient` is an actor that owns token state, networking, validation and Keychain access. A separate `@MainActor` browser-session bridge presents `ASWebAuthenticationSession`. An operation guard prevents actor reentrancy from overlapping refresh/sign-in/sign-out operations across suspension points.
+
 The native sample removes a consumed refresh token from Keychain before sending the request and stores its replacement after validation. Network loss during refresh requires sign-in again rather than replaying the consumed token. This trades seamless recovery for avoiding ambiguous reuse. Never retry a refresh blindly.
 
 Sign-out clears local state and POSTs `client_id` and `token` to the revocation endpoint. Revocation invalidates the entire family. This is local sign-out plus token revocation, not OIDC RP-initiated or back-channel logout; no reusable provider SSO cookie is created. The web sample requests no refresh token and holds its access token only in memory.

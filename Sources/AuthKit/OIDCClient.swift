@@ -1,13 +1,7 @@
 #if os(iOS) || os(macOS)
-import AuthenticationServices
 import CryptoKit
 import Foundation
 import Security
-#if os(iOS)
-import UIKit
-#else
-import AppKit
-#endif
 
 struct OIDCDiscovery: Decodable, Sendable {
     let issuer: String
@@ -46,15 +40,15 @@ private struct OIDCClientError: LocalizedError {
     var errorDescription: String? { message }
 }
 
-@MainActor
-final class OIDCClient: NSObject, ASWebAuthenticationPresentationContextProviding {
+// Owns authentication state and networking independently of the UI executor.
+actor OIDCClient {
     private let issuer: URL
     private let clientID: String
     private let redirectURI: URL
-    private var browser: ASWebAuthenticationSession?
     private var accessToken: String?
     private var subject: String?
     private var expires = Date.distantPast
+    // Actor methods can reenter at suspension points. Keep each token operation exclusive across awaits.
     private var busy = false
     private var keychainService: String { "com.patmalt.oidc." + Self.encode(Data((issuer.absoluteString + "|" + clientID + "|" + redirectURI.absoluteString).utf8).sha256Data) }
 
@@ -183,26 +177,8 @@ final class OIDCClient: NSObject, ASWebAuthenticationPresentationContextProvidin
     }
 
     private func authenticate(url: URL) async throws -> URL {
-        defer { browser = nil }
-        return try await withTaskCancellationHandler {
-            try await withCheckedThrowingContinuation { continuation in
-                let session = ASWebAuthenticationSession(url: url, callbackURLScheme: redirectURI.scheme) { url, error in
-                    if let url { continuation.resume(returning: url) }
-                    else { continuation.resume(throwing: error ?? OIDCClientError(message: "Sign-in cancelled")) }
-                }
-                browser = session; session.presentationContextProvider = self
-                session.prefersEphemeralWebBrowserSession = true
-                if !session.start() { continuation.resume(throwing: OIDCClientError(message: "Could not open browser authentication")) }
-            }
-        } onCancel: { Task { @MainActor in self.browser?.cancel() } }
-    }
-
-    func presentationAnchor(for session: ASWebAuthenticationSession) -> ASPresentationAnchor {
-        #if os(iOS)
-        return UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.flatMap(\.windows).first { $0.isKeyWindow } ?? ASPresentationAnchor()
-        #else
-        return NSApplication.shared.windows.first { $0.isKeyWindow } ?? ASPresentationAnchor()
-        #endif
+        let presenter = await OIDCBrowserSession()
+        return try await presenter.authenticate(url: url, callbackURLScheme: redirectURI.scheme)
     }
 
     private func formRequest(_ url: URL, _ fields: [String: String]) -> URLRequest {
