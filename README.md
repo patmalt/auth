@@ -62,6 +62,6 @@ node --test Tests/Web/*.test.mjs
 swift build --target AuthKit # On macOS
 ```
 
-CI runs Swift tests against DynamoDB Local, web cryptographic/callback tests, and an Apple-platform AuthKit build. Set `DYNAMODB_TEST_ENDPOINT` plus local AWS credentials to run the DynamoDB integration tests outside CI. They create and delete uniquely named test tables.
+Run the checks above locally. Set `DYNAMODB_TEST_ENDPOINT` plus local AWS credentials to include DynamoDB integration tests; those tests create and delete uniquely named test tables. No CI workflow is configured.
 
 Browser/passkey hardware and signed app Keychain flows still need to be exercised with your real domains and registered callbacks. This project is not OpenID certified.
