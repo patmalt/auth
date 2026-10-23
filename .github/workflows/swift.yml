@@ -1,0 +1,15 @@
+name: Swift
+on:
+  pull_request:
+  push:
+    branches: [main]
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    container: swift:6.2-jammy
+    steps:
+      - uses: actions/checkout@v4
+      - run: apt-get update && apt-get install -y libssl-dev pkg-config
+      - run: swift test

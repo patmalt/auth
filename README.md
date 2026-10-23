@@ -10,6 +10,10 @@ This repository contains:
 - macOS sample app illustrating integration of `AuthKit` to authenticate with passkeys.
 - static web sample illustrating use of the auth service.
 
+## OpenID Connect
+
+An opt-in OIDC provider supports authorization code + S256 PKCE, browser passkey sign-in, discovery/JWKS, ES256 ID tokens, UserInfo, refresh rotation and revocation. See [configuration, client flow, and deployment limits](Docs/oidc.md). OIDC grants are process-local and require a single server instance.
+
 ## Endpoints
 
 - `GET /`
@@ -354,3 +358,4 @@ Then serve the static sample separately from `Samples/AuthDemoWebApp`, for examp
 - docker buildx build \-\-platform linux/arm64 \-\-load \-t {REPO_NAME} .
 - docker tag {REPO_NAME}:{TAG} {REPO_URI}:{TAG}
 - docker push {REPO_URI}:{TAG}
+

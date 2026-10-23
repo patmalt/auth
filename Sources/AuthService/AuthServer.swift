@@ -10,18 +10,21 @@ actor AuthServer {
     private let jwtService: JWTService
     private let webAuthnVerifier: any WebAuthnVerifying
     private let logger: Logger
+    private let oidc: OIDCProvider?
 
     init(
         configuration: ServiceConfiguration,
         store: any CredentialStoring,
         logger: Logger,
-        webAuthnVerifier: any WebAuthnVerifying = WebAuthnVerifier()
+        webAuthnVerifier: any WebAuthnVerifying = WebAuthnVerifier(),
+        oidc: OIDCProvider? = nil
     ) {
         self.configuration = configuration
         self.store = store
         self.jwtService = JWTService(configuration: configuration)
         self.webAuthnVerifier = webAuthnVerifier
         self.logger = logger
+        self.oidc = oidc
     }
 
     func run() async throws {
@@ -76,6 +79,8 @@ actor AuthServer {
     func handleRequest(_ request: HTTPRequestAccumulator, context: RequestContext) async throws -> HTTPResponsePayload {
         let requestLogger = logger.with(request: context)
         requestLogger.info("Request started", metadata: ["content_length": .stringConvertible(request.body.count)])
+
+        if let oidc, let response = await oidc.respond(to: request) { return response }
 
         switch (request.method, request.uri) {
         case (.OPTIONS, _):
