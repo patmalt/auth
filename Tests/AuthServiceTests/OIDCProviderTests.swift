@@ -2,6 +2,7 @@ import XCTest
 import Foundation
 import NIOHTTP1
 import AWSDynamoDB
+import Logging
 #if canImport(CryptoKit)
 import CryptoKit
 #else
@@ -206,7 +207,7 @@ final class OIDCProviderTests: XCTestCase {
 
     func testDynamoDBTransactionsAndCrossInstanceFlow() async throws {
         guard let endpoint = ProcessInfo.processInfo.environment["DYNAMODB_TEST_ENDPOINT"] else { throw XCTSkip("DynamoDB Local endpoint not configured") }
-        let config = try await DynamoDBClient.DynamoDBClientConfig(region: "us-east-1")
+        var config = try await DynamoDBClient.DynamoDBClientConfig(region: "us-east-1")
         config.endpoint = endpoint
         let client = DynamoDBClient(config: config)
         let table = "OIDCTest" + UUID().uuidString.replacingOccurrences(of: "-", with: "")
@@ -222,6 +223,66 @@ final class OIDCProviderTests: XCTestCase {
             throw error
         }
         _ = try await client.deleteTable(input: DeleteTableInput(tableName: table))
+    }
+
+    func testHostedRegistrationUsesVerifiedPasskeyAndRequiresUV() async throws {
+        for verified in [true, false] {
+            let credentials = InMemoryCredentialStore()
+            let provider = OIDCProvider(configuration: configuration(), service: .fromEnvironment(), store: credentials)
+            let initial = await provider.respond(to: authorization())
+            let page = try XCTUnwrap(initial)
+            let cookie = try XCTUnwrap(page.headers["Set-Cookie"]?.components(separatedBy: ";").first)
+            let transaction = String(cookie.dropFirst("__Host-oidc=".count))
+            func loginRequest(_ path: String, _ payload: [String: Any]) throws -> HTTPRequestAccumulator {
+                HTTPRequestAccumulator(method: .POST, uri: path, headers: ["Origin": "https://example.com", "Content-Type": "application/json", "Cookie": cookie],
+                    body: try JSONSerialization.data(withJSONObject: payload.merging(["transaction": transaction]) { a, _ in a }))
+            }
+            let begin = try object(await provider.respond(to: loginRequest("/oauth/login/begin", ["username": "bob", "mode": "register"])))
+            let key = P256.Signing.PrivateKey()
+            let raw = key.publicKey.rawRepresentation
+            // COSE EC2 / ES256 / P-256 with the real test key's X and Y coordinates.
+            var cose = Data([0xa5, 0x01, 0x02, 0x03, 0x26, 0x20, 0x01, 0x21, 0x58, 0x20])
+            cose.append(raw.prefix(32)); cose.append(contentsOf: [0x22, 0x58, 0x20]); cose.append(raw.suffix(32))
+            var authData = Data("example.com".utf8).sha256()
+            authData.append(verified ? 0x45 : 0x41)
+            authData.append(Data(repeating: 0, count: 4 + 16)); authData.append(contentsOf: [0, 1, 9]); authData.append(cose)
+            var attestation = Data([0xa3, 0x63]); attestation.append(Data("fmt".utf8)); attestation.append(0x64); attestation.append(Data("none".utf8))
+            attestation.append(0x68); attestation.append(Data("authData".utf8)); attestation.append(contentsOf: [0x58, UInt8(authData.count)]); attestation.append(authData)
+            attestation.append(0x67); attestation.append(Data("attStmt".utf8)); attestation.append(0xa0)
+            let clientData = try JSONSerialization.data(withJSONObject: ["origin": "https://example.com", "type": "webauthn.create", "challenge": begin["challenge"] as! String])
+            let response = await provider.respond(to: try loginRequest("/oauth/register/complete", ["credential": ["id": "CQ", "rawID": "CQ", "type": "public-key",
+                "clientDataJSON": Base64URL.encode(clientData), "attestationObject": Base64URL.encode(attestation)]]))
+            let saved = try await credentials.credential(for: "bob")
+            if verified {
+                XCTAssertEqual(response?.status, .ok)
+                XCTAssertNotNil(try object(response)["redirect"])
+                XCTAssertEqual(saved?.publicKeyX963, key.publicKey.x963Representation)
+                // Registering the username again cannot overwrite its identity or public key.
+                do {
+                    try await credentials.saveCredential(StoredCredential(credentialID: Data([8]), username: "bob", userID: Data([8]), publicKeyX963: Data(), signCount: 0))
+                    XCTFail("Duplicate registration was accepted")
+                } catch { }
+                let unchanged = try await credentials.credential(for: "bob")
+                XCTAssertEqual(unchanged?.userID, saved?.userID)
+            } else {
+                XCTAssertEqual(response?.status, .badRequest)
+                XCTAssertNil(saved)
+            }
+        }
+    }
+
+    func testLegacyRoutesAreRetiredAndOIDCPreflightWorks() async throws {
+        let provider = try await provider()
+        let server = AuthServer(configuration: .fromEnvironment(), store: InMemoryCredentialStore(), logger: Logger(label: "test"), oidc: provider)
+        for path in ["/register/begin", "/register/complete", "/authenticate/begin", "/authenticate/complete", "/me"] {
+            let request = HTTPRequestAccumulator(method: path == "/me" ? .GET : .POST, uri: path)
+            let response = await server.respond(to: request, context: RequestContext(requestID: "test", method: request.method.rawValue, path: path, clientIP: nil, userAgent: nil))
+            XCTAssertEqual(response.status, .notFound)
+        }
+        let response = await server.respond(to: HTTPRequestAccumulator(method: .OPTIONS, uri: "/oauth/token", headers: ["Origin": "https://example.com"]),
+            context: RequestContext(requestID: "test", method: "OPTIONS", path: "/oauth/token", clientIP: nil, userAgent: nil))
+        XCTAssertEqual(response.status, .noContent)
+        XCTAssertEqual(response.headers["Access-Control-Allow-Origin"], "https://example.com")
     }
 
     func testPKCEParsing() throws {

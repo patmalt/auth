@@ -215,6 +215,8 @@ actor OIDCProvider {
               let object = body["credential"], let data = try? JSONSerialization.data(withJSONObject: object),
               let assertion = try? JSONDecoder().decode(AssertionCredential.self, from: data),
               let stored = try await store.credential(for: username),
+              assertion.id == assertion.rawID, assertion.rawID == Base64URL.encode(stored.credentialID),
+              assertion.userHandle == nil || assertion.userHandle == Base64URL.encode(stored.userID),
               validClientData(assertion.clientDataJSON, type: "webauthn.get"),
               let authData = try? Base64URL.decode(assertion.authenticatorData), authData.count >= 37,
               authData[32] & 0x04 != 0, assertion.type == "public-key" else { throw OAuthFailure(code: "access_denied") }

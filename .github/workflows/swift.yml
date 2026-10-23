@@ -21,11 +21,17 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: apt-get update && apt-get install -y libssl-dev pkg-config
-      - uses: actions/cache@v4
+      - uses: actions/cache/restore@v4
+        id: server-cache
         with:
           path: .build
           key: swift-linux-6.2-${{ hashFiles('Package.resolved') }}
       - run: swift test
+      - uses: actions/cache/save@v4
+        if: always() && steps.server-cache.outputs.cache-hit != 'true'
+        with:
+          path: .build
+          key: swift-linux-6.2-${{ hashFiles('Package.resolved') }}
   apple:
     runs-on: macos-15
     steps:
@@ -33,7 +39,17 @@ jobs:
       - uses: swift-actions/setup-swift@v2
         with:
           swift-version: '6.2'
-      - run: swift build --target AuthKit
+      - uses: actions/cache/restore@v4
+        id: apple-cache
+        with:
+          path: .build
+          key: swift-macos-6.2-${{ hashFiles('Package.resolved') }}
+      - run: swift build --product AuthDemoMacApp
+      - uses: actions/cache/save@v4
+        if: always() && steps.apple-cache.outputs.cache-hit != 'true'
+        with:
+          path: .build
+          key: swift-macos-6.2-${{ hashFiles('Package.resolved') }}
   web:
     runs-on: ubuntu-latest
     steps:

@@ -6,7 +6,7 @@ actor DynamoDBGrantStore: GrantStoring {
     private let table: String
 
     init(region: String, table: String, endpoint: String? = nil) async throws {
-        let config = try await DynamoDBClient.DynamoDBClientConfig(region: region)
+        var config = try await DynamoDBClient.DynamoDBClientConfig(region: region)
         if let endpoint { config.endpoint = endpoint }
         self.client = DynamoDBClient(config: config)
         self.table = table
@@ -55,8 +55,9 @@ actor DynamoDBGrantStore: GrantStoring {
             return true
         } catch let error as TransactionCanceledException {
             // Never hide IAM, capacity, schema, or transport failures as invalid credentials.
-            if error.cancellationReasons?.contains(where: { $0.code == "ConditionalCheckFailed" || $0.code == "TransactionConflict" }) == true {
-                return false
+            for reason in error.properties.cancellationReasons ?? [] {
+                if reason.code == "ConditionalCheckFailed" { return false }
+                if reason.code == "TransactionConflict" { return false }
             }
             throw error
         }
