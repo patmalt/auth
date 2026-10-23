@@ -23,6 +23,7 @@ var targets: [Target] = [
     .target(
         name: "AuthKit",
     ),
+    .testTarget(name: "AuthServiceTests", dependencies: ["AuthService"]),
 ]
 
 #if os(macOS)
@@ -52,3 +53,4 @@ let package = Package(
     ],
     targets: targets
 )
+

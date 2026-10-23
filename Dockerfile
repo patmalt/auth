@@ -9,6 +9,7 @@ COPY Package.swift ./
 COPY Package.resolved ./
 RUN swift package resolve
 COPY Sources ./Sources
+COPY Tests ./Tests
 RUN swift build -c release --product AuthService
 
 FROM swift:6.2-jammy-slim
@@ -19,3 +20,4 @@ COPY --from=build /app/.build/release/AuthService /app/AuthService
 USER appuser
 EXPOSE 8080
 CMD ["/app/AuthService"]
+

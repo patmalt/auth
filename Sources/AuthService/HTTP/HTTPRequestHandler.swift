@@ -47,7 +47,7 @@ final class HTTPRequestHandler: ChannelInboundHandler, Sendable {
         let requestContext = RequestContext(
             requestID: request.headers.requestID(),
             method: request.method.rawValue,
-            path: request.uri,
+            path: String(request.uri.split(separator: "?", maxSplits: 1).first ?? "/"),
             clientIP: request.headers.clientIP(),
             userAgent: request.headers.first(name: "user-agent")
         )
@@ -99,3 +99,4 @@ final class HTTPRequestHandler: ChannelInboundHandler, Sendable {
         )
     }
 }
+
