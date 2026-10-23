@@ -11,11 +11,6 @@ struct ServiceConfiguration {
     let storeDriver: String
     let awsRegion: String
     let dynamoDBCredentialsTable: String
-    let dynamoDBChallengesTable: String
-    let jwtIssuer: String
-    let jwtAudience: String
-    let jwtSecret: String
-    let tokenLifetime: TimeInterval
     let logLevel: Logger.Level
 
     static func fromEnvironment() -> ServiceConfiguration {
@@ -32,14 +27,9 @@ struct ServiceConfiguration {
             relyingPartyName: environment["RP_NAME"] ?? "Auth Demo",
             origin: configuredOrigin,
             corsAllowedOrigins: configuredCORSOrigins,
-            storeDriver: environment["STORE_DRIVER"] ?? "memory",
+            storeDriver: environment["STORE_DRIVER"] ?? "dynamodb",
             awsRegion: environment["AWS_REGION"] ?? "us-east-1",
             dynamoDBCredentialsTable: environment["DYNAMODB_CREDENTIALS_TABLE"] ?? "PasskeyCredentials",
-            dynamoDBChallengesTable: environment["DYNAMODB_CHALLENGES_TABLE"] ?? "PasskeyChallenges",
-            jwtIssuer: environment["JWT_ISSUER"] ?? "auth-service",
-            jwtAudience: environment["JWT_AUDIENCE"] ?? "auth-clients",
-            jwtSecret: environment["JWT_SECRET"] ?? "replace-me-in-secrets-manager",
-            tokenLifetime: TimeInterval(environment["JWT_LIFETIME_SECONDS"] ?? "3600") ?? 3600,
             logLevel: Logger.Level(environmentVariable: environment["AUTH_LOG_LEVEL"])
         )
     }
@@ -53,3 +43,4 @@ private func parseConfiguredOrigins(_ value: String?, fallback: String) -> Set<S
 
     return origins.isEmpty ? [fallback] : Set(origins)
 }
+

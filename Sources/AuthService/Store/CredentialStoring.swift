@@ -1,6 +1,4 @@
 protocol CredentialStoring: Actor {
-    func saveChallenge(_ challenge: ChallengeRecord) async throws
-    func takeChallenge(username: String, kind: ChallengeKind) async throws -> ChallengeRecord
     func credential(for username: String) async throws -> StoredCredential?
     func saveCredential(_ credential: StoredCredential) async throws
     func updateSignCount(username: String, signCount: UInt32) async throws
@@ -18,3 +16,4 @@ enum CredentialStoreFactory {
         }
     }
 }
+

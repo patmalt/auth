@@ -1,6 +1,7 @@
 import XCTest
 import Foundation
 import NIOHTTP1
+import AWSDynamoDB
 #if canImport(CryptoKit)
 import CryptoKit
 #else
@@ -31,11 +32,12 @@ final class OIDCProviderTests: XCTestCase {
     let verifier = String(repeating: "a", count: 43)
     let redirect = "https://client.example/callback"
 
-    private func provider(clock: TestClock = TestClock()) async throws -> OIDCProvider {
-        let store = InMemoryCredentialStore()
-        try await store.saveCredential(StoredCredential(credentialID: Data([1]), username: "alice", userID: Data([2]),
-            publicKeyX963: Data(), signCount: 0))
-        return OIDCProvider(configuration: configuration(), service: .fromEnvironment(), store: store, verifier: StubVerifier(), now: { clock.date() })
+    private func provider(clock: TestClock = TestClock(), grants: any GrantStoring = InMemoryGrantStore(), credentials: (any CredentialStoring)? = nil) async throws -> OIDCProvider {
+        let store: any CredentialStoring = credentials ?? InMemoryCredentialStore()
+        if try await store.credential(for: "alice") == nil {
+            try await store.saveCredential(StoredCredential(credentialID: Data([1]), username: "alice", userID: Data([2]), publicKeyX963: Data(), signCount: 0))
+        }
+        return OIDCProvider(configuration: configuration(), service: .fromEnvironment(), store: store, verifier: StubVerifier(), grants: grants, now: { clock.date() })
     }
     func configuration() -> OIDCConfiguration {
         OIDCConfiguration(issuer: "https://example.com", clients: [OIDCClient(clientID: "test", redirectURIs: [redirect])], signingKey: P256.Signing.PrivateKey())
@@ -56,7 +58,8 @@ final class OIDCProviderTests: XCTestCase {
         let form = request("/oauth/authorize", p)
         return HTTPRequestAccumulator(method: .GET, uri: "/oauth/authorize?" + String(data: form.body, encoding: .utf8)!)
     }
-    func login(_ provider: OIDCProvider) async throws -> String {
+    func login(_ provider: OIDCProvider, other: OIDCProvider? = nil) async throws -> String {
+        let worker = other ?? provider
         let initialResponse = await provider.respond(to: authorization())
         let response = try XCTUnwrap(initialResponse)
         XCTAssertEqual(response.status, .ok)
@@ -66,7 +69,7 @@ final class OIDCProviderTests: XCTestCase {
             HTTPRequestAccumulator(method: .POST, uri: path, headers: ["Origin": "https://example.com", "Content-Type": "application/json", "Cookie": cookie],
                 body: try JSONSerialization.data(withJSONObject: body.merging(["transaction": transaction]) { a, _ in a }))
         }
-        let begin = try object(await provider.respond(to: loginRequest("/oauth/login/begin", ["username": "alice"])))
+        let begin = try object(await worker.respond(to: loginRequest("/oauth/login/begin", ["username": "alice"])))
         let clientData = try JSONSerialization.data(withJSONObject: ["origin": "https://example.com", "challenge": try XCTUnwrap(begin["challenge"] as? String), "type": "webauthn.get"])
         let assertion = ["id": "AQ", "rawID": "AQ", "type": "public-key", "authenticatorData": Base64URL.encode(Data(repeating: 4, count: 37)),
             "clientDataJSON": Base64URL.encode(clientData), "signature": "AA"]
@@ -171,6 +174,54 @@ final class OIDCProviderTests: XCTestCase {
         XCTAssertEqual(revoked?.status, .ok)
         let rejected = await provider.respond(to: userRequest)
         XCTAssertEqual(rejected?.status, .unauthorized)
+    }
+
+    func testSharedProvidersAndConcurrentCodeRedemption() async throws {
+        try await sharedProviderFlow(grants: InMemoryGrantStore())
+    }
+
+    func sharedProviderFlow(grants: any GrantStoring, otherGrants: (any GrantStoring)? = nil) async throws {
+        let credentials = InMemoryCredentialStore()
+        let first = try await provider(grants: grants, credentials: credentials)
+        let second = try await provider(grants: otherGrants ?? grants, credentials: credentials)
+        let code = try await login(first, other: second)
+        let tokenRequest = request("/oauth/token", ["grant_type": "authorization_code", "client_id": "test", "redirect_uri": redirect, "code": code, "code_verifier": verifier])
+        async let a = first.respond(to: tokenRequest)
+        async let b = second.respond(to: tokenRequest)
+        let responses = await [a, b]
+        XCTAssertEqual(responses.filter { $0?.status == .ok }.count, 1)
+        XCTAssertEqual(responses.filter { $0?.status == .badRequest }.count, 1)
+        let tokens = try object(responses.first { $0?.status == .ok }!)
+        // Simulate replacing all provider processes while keeping only the shared database.
+        let restarted = try await provider(grants: otherGrants ?? grants, credentials: credentials)
+        let rotated = try object(await restarted.respond(to: request("/oauth/token", ["grant_type": "refresh_token", "client_id": "test", "refresh_token": tokens["refresh_token"] as! String])))
+        let userRequest = HTTPRequestAccumulator(uri: "/oauth/userinfo", headers: ["Authorization": "Bearer " + (rotated["access_token"] as! String)])
+        let user = await second.respond(to: userRequest)
+        XCTAssertEqual(user?.status, .ok)
+        let replay = await first.respond(to: request("/oauth/token", ["grant_type": "refresh_token", "client_id": "test", "refresh_token": tokens["refresh_token"] as! String]))
+        XCTAssertEqual(replay?.status, .badRequest)
+        let rejected = await restarted.respond(to: userRequest)
+        XCTAssertEqual(rejected?.status, .unauthorized)
+    }
+
+    func testDynamoDBTransactionsAndCrossInstanceFlow() async throws {
+        guard let endpoint = ProcessInfo.processInfo.environment["DYNAMODB_TEST_ENDPOINT"] else { throw XCTSkip("DynamoDB Local endpoint not configured") }
+        let config = try await DynamoDBClient.DynamoDBClientConfig(region: "us-east-1")
+        config.endpoint = endpoint
+        let client = DynamoDBClient(config: config)
+        let table = "OIDCTest" + UUID().uuidString.replacingOccurrences(of: "-", with: "")
+        _ = try await client.createTable(input: CreateTableInput(attributeDefinitions: [.init(attributeName: "pk", attributeType: .s)],
+            billingMode: .payPerRequest, keySchema: [.init(attributeName: "pk", keyType: .hash)], tableName: table))
+        do {
+            let store = try await DynamoDBGrantStore(region: "us-east-1", table: table, endpoint: endpoint)
+            try await GrantStoreTests.exercise(store)
+            let other = try await DynamoDBGrantStore(region: "us-east-1", table: table, endpoint: endpoint)
+            try await sharedProviderFlow(grants: store, otherGrants: other)
+        } catch {
+            _ = try? await client.deleteTable(input: DeleteTableInput(tableName: table))
+            throw error
+        }
+        _ = try await client.deleteTable(input: DeleteTableInput(tableName: table))
     }
 
     func testPKCEParsing() throws {

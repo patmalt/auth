@@ -2,30 +2,12 @@ import Foundation
 
 actor InMemoryCredentialStore: CredentialStoring {
     private var credentialsByUsername: [String: StoredCredential] = [:]
-    private var challengesByUsername: [String: ChallengeRecord] = [:]
-
-    func saveChallenge(_ challenge: ChallengeRecord) async throws {
-        challengesByUsername[challenge.username] = challenge
-    }
-
-    func takeChallenge(username: String, kind: ChallengeKind) async throws -> ChallengeRecord {
-        guard let challenge = challengesByUsername.removeValue(forKey: username) else {
-            throw HTTPError.badRequest("No active challenge for \(username)")
-        }
-        guard challenge.kind == kind else {
-            throw HTTPError.badRequest("Challenge kind mismatch")
-        }
-        guard challenge.expiresAt > Date() else {
-            throw HTTPError.badRequest("Challenge expired")
-        }
-        return challenge
-    }
-
     func credential(for username: String) async throws -> StoredCredential? {
         credentialsByUsername[username]
     }
 
     func saveCredential(_ credential: StoredCredential) async throws {
+        guard credentialsByUsername[credential.username] == nil else { throw HTTPError.conflict("Username already registered") }
         credentialsByUsername[credential.username] = credential
     }
 
@@ -33,7 +15,9 @@ actor InMemoryCredentialStore: CredentialStoring {
         guard var credential = credentialsByUsername[username] else {
             return
         }
+        guard signCount >= credential.signCount else { throw HTTPError.unauthorized("Authenticator sign count regressed") }
         credential.signCount = signCount
         credentialsByUsername[username] = credential
     }
 }
+

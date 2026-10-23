@@ -16,8 +16,8 @@ struct OIDCConfiguration: Sendable {
     let signingKey: P256.Signing.PrivateKey
     var keyID: String { Base64URL.encode(Data(signingKey.publicKey.rawRepresentation).sha256()) }
 
-    static func fromEnvironment(_ env: [String: String] = ProcessInfo.processInfo.environment) throws -> Self? {
-        guard let issuer = env["OIDC_ISSUER"] else { return nil }
+    static func fromEnvironment(_ env: [String: String] = ProcessInfo.processInfo.environment) throws -> Self {
+        guard let issuer = env["OIDC_ISSUER"] else { throw HTTPError.internalServerError("OIDC_ISSUER is required") }
         guard let json = env["OIDC_CLIENTS_JSON"], let pem = env["OIDC_SIGNING_KEY_PEM"] else {
             throw HTTPError.internalServerError("OIDC requires OIDC_CLIENTS_JSON and OIDC_SIGNING_KEY_PEM")
         }

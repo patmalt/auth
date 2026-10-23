@@ -11,13 +11,18 @@ enum ServiceMain {
             logger.info("Starting auth service")
             let store = try await CredentialStoreFactory.makeStore(configuration: configuration)
             let oidcConfiguration = try OIDCConfiguration.fromEnvironment()
-            if let oidcConfiguration {
-                guard configuration.origin == oidcConfiguration.issuer else {
-                    throw HTTPError.internalServerError("RP_ORIGIN must equal OIDC_ISSUER")
-                }
-                logger.warning("OIDC uses process-local grants: run exactly one instance; restart invalidates sessions")
+            guard configuration.origin == oidcConfiguration.issuer else {
+                throw HTTPError.internalServerError("RP_ORIGIN must equal OIDC_ISSUER")
             }
-            let oidc = oidcConfiguration.map { OIDCProvider(configuration: $0, service: configuration, store: store) }
+            let grants: any GrantStoring
+            if configuration.storeDriver.lowercased() == "memory" {
+                logger.warning("Explicit memory mode is for local development only; sessions are lost on restart")
+                grants = InMemoryGrantStore()
+            } else {
+                grants = try await DynamoDBGrantStore(region: configuration.awsRegion,
+                    table: ProcessInfo.processInfo.environment["DYNAMODB_OIDC_TABLE"] ?? "OIDCGrants")
+            }
+            let oidc = OIDCProvider(configuration: oidcConfiguration, service: configuration, store: store, grants: grants)
             let server = AuthServer(configuration: configuration, store: store, logger: logger, oidc: oidc)
             try await server.run()
         } catch {

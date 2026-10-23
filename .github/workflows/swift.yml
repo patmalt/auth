@@ -1,4 +1,4 @@
-name: Swift
+name: Auth checks
 on:
   pull_request:
   push:
@@ -6,10 +6,39 @@ on:
 permissions:
   contents: read
 jobs:
-  test:
+  server:
     runs-on: ubuntu-latest
     container: swift:6.2-jammy
+    services:
+      dynamodb:
+        image: amazon/dynamodb-local:latest
+        ports: [8000:8000]
+    env:
+      AWS_ACCESS_KEY_ID: local
+      AWS_SECRET_ACCESS_KEY: local
+      AWS_REGION: us-east-1
+      DYNAMODB_TEST_ENDPOINT: http://dynamodb:8000
     steps:
       - uses: actions/checkout@v4
       - run: apt-get update && apt-get install -y libssl-dev pkg-config
+      - uses: actions/cache@v4
+        with:
+          path: .build
+          key: swift-linux-6.2-${{ hashFiles('Package.resolved') }}
       - run: swift test
+  apple:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: swift-actions/setup-swift@v2
+        with:
+          swift-version: '6.2'
+      - run: swift build --target AuthKit
+  web:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - run: node --test Tests/Web/*.test.mjs

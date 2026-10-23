@@ -5,7 +5,7 @@ private struct OAuthFailure: Error {
     let code: String
 }
 
-private struct Authorization {
+private struct Authorization: Codable, Sendable {
     let clientID: String
     let redirectURI: String
     let scope: Set<String>
@@ -15,9 +15,10 @@ private struct Authorization {
     let expires: Date
     var username: String?
     var passkeyChallenge: Data?
+    var registrationUserID: Data?
 }
 
-private struct Grant {
+private struct Grant: Codable, Sendable {
     let authorization: Authorization
     let subject: String
     let username: String
@@ -26,39 +27,37 @@ private struct Grant {
     let expires: Date
 }
 
-private struct RefreshRecord {
+private struct RefreshRecord: Codable, Sendable {
     let grant: Grant
     var used: Bool = false
 }
 
-/// All grants are process-local. Actor isolation makes code redemption and refresh rotation atomic.
+private struct TokenFamily: Codable, Sendable { var revoked = false }
+
+/// Security state is shared through GrantStoring; actor isolation is not relied on for redemption.
 actor OIDCProvider {
     private let configuration: OIDCConfiguration
     private let service: ServiceConfiguration
     private let store: any CredentialStoring
     private let verifier: any WebAuthnVerifying
-    private var pending: [String: Authorization] = [:]
-    private var codes: [String: Grant] = [:]
-    private var access: [String: Grant] = [:]
-    private var refresh: [String: RefreshRecord] = [:]
-    private var revoked: Set<String> = []
+    private let grants: any GrantStoring
     private let now: @Sendable () -> Date
 
     init(configuration: OIDCConfiguration, service: ServiceConfiguration, store: any CredentialStoring,
-         verifier: any WebAuthnVerifying = WebAuthnVerifier(), now: @escaping @Sendable () -> Date = { Date() }) {
+         verifier: any WebAuthnVerifying = WebAuthnVerifier(), grants: any GrantStoring = InMemoryGrantStore(), now: @escaping @Sendable () -> Date = { Date() }) {
         self.configuration = configuration
         self.service = service
         self.store = store
         self.verifier = verifier
         self.now = now
+        self.grants = grants
     }
 
     func respond(to request: HTTPRequestAccumulator) async -> HTTPResponsePayload? {
         let path = String(request.uri.split(separator: "?", maxSplits: 1).first ?? "/")
         let routes = ["/.well-known/openid-configuration", "/oauth/jwks", "/oauth/authorize", "/oauth/login/begin",
-                      "/oauth/login/complete", "/oauth/token", "/oauth/userinfo", "/oauth/revoke"]
+                      "/oauth/login/complete", "/oauth/register/complete", "/oauth/token", "/oauth/userinfo", "/oauth/revoke"]
         guard routes.contains(path) else { return nil }
-        cleanup()
         do {
             switch (request.method, path) {
             case (.GET, "/.well-known/openid-configuration"):
@@ -66,17 +65,19 @@ actor OIDCProvider {
             case (.GET, "/oauth/jwks"):
                 return try json(["keys": [OIDCSigner(configuration: configuration).jwk]])
             case (.GET, "/oauth/authorize"):
-                return try authorize(request)
+                return try await authorize(request)
             case (.POST, "/oauth/login/begin"):
                 return try await beginLogin(request)
             case (.POST, "/oauth/login/complete"):
                 return try await completeLogin(request)
+            case (.POST, "/oauth/register/complete"):
+                return try await completeRegistration(request)
             case (.POST, "/oauth/token"):
-                return try token(request)
+                return try await token(request)
             case (.GET, "/oauth/userinfo"), (.POST, "/oauth/userinfo"):
-                return try userInfo(request)
+                return try await userInfo(request)
             case (.POST, "/oauth/revoke"):
-                return try revoke(request)
+                return try await revoke(request)
             default: throw OAuthFailure(code: "invalid_request")
             }
         } catch let failure as OAuthFailure {
@@ -108,7 +109,7 @@ actor OIDCProvider {
                 "request_uri_parameter_supported": false]
     }
 
-    private func authorize(_ request: HTTPRequestAccumulator) throws -> HTTPResponsePayload {
+    private func authorize(_ request: HTTPRequestAccumulator) async throws -> HTTPResponsePayload {
         let parts = request.uri.split(separator: "?", maxSplits: 1, omittingEmptySubsequences: false)
         let p = try Self.parameters(parts.count == 2 ? String(parts[1]) : "")
         // Never redirect before both client and exact redirect URI have been validated.
@@ -117,7 +118,7 @@ actor OIDCProvider {
             throw OAuthFailure(code: "invalid_request")
         }
         func fail(_ code: String) throws -> HTTPResponsePayload {
-            try redirectResponse(redirect, values: ["error": code, "state": p["state"]])
+            try redirectResponse(redirect, values: ["error": code, "state": p["state"], "iss": configuration.issuer])
         }
         guard p["response_type"] == "code" else { return try fail("unsupported_response_type") }
         let scopes = Set((p["scope"] ?? "").split(separator: " ").map(String.init))
@@ -136,10 +137,13 @@ actor OIDCProvider {
         if let prompt = p["prompt"], !["login", "consent", "select_account"].contains(prompt) {
             return try fail("invalid_request")
         }
-        guard pending.count < 1000 else { throw OAuthFailure(code: "temporarily_unavailable") }
         let transaction = randomToken()
-        pending[hash(transaction)] = Authorization(clientID: client.clientID, redirectURI: redirect, scope: scopes,
+        let auth = Authorization(clientID: client.clientID, redirectURI: redirect, scope: scopes,
             state: p["state"], nonce: p["nonce"], challenge: challenge, expires: now().addingTimeInterval(300))
+        let record = try GrantRecord(key: "login#" + hash(transaction), value: auth, expires: auth.expires)
+        guard try await grants.transact(expected: [], putting: [record], deleting: [], now: now()) else {
+            throw OAuthFailure(code: "temporarily_unavailable")
+        }
         let scriptNonce = randomToken()
         let html = OIDCLoginPage.html(transaction: transaction, clientID: client.clientID, scopes: scopes.sorted().joined(separator: " "), nonce: scriptNonce)
         return HTTPResponsePayload(status: .ok, headers: [
@@ -150,62 +154,118 @@ actor OIDCProvider {
         ], body: Data(html.utf8))
     }
 
-    private func loginBody(_ request: HTTPRequestAccumulator) throws -> (String, [String: Any]) {
-        guard request.headers["Origin"].first == configuration.issuer,
+    private func loginBody(_ request: HTTPRequestAccumulator) async throws -> (GrantRecord, [String: Any]) {
+        guard request.body.count <= 32768, request.headers["Origin"].first == configuration.issuer,
               request.headers["Content-Type"].first?.lowercased().hasPrefix("application/json") == true,
               let body = try? jsonObject(from: request.body), let tx = body["transaction"] as? String,
               request.headers["Cookie"].joined(separator: ";").split(separator: ";").contains(where: {
                   $0.trimmingCharacters(in: .whitespaces) == "__Host-oidc=" + tx
-              }), pending[hash(tx)] != nil else { throw OAuthFailure(code: "invalid_request") }
-        return (hash(tx), body)
+              }), let record = try await grants.get("login#" + hash(tx), now: now()) else {
+            throw OAuthFailure(code: "invalid_request")
+        }
+        return (record, body)
     }
 
     private func beginLogin(_ request: HTTPRequestAccumulator) async throws -> HTTPResponsePayload {
-        let (tx, body) = try loginBody(request)
-        guard var auth = pending.removeValue(forKey: tx), let username = body["username"] as? String else {
+        let (record, body) = try await loginBody(request)
+        var auth = try record.decode(Authorization.self)
+        guard auth.passkeyChallenge == nil, let username = body["username"] as? String, !username.isEmpty else {
             throw OAuthFailure(code: "invalid_request")
         }
-        // Reserve the transaction before suspension so concurrent requests cannot replace its challenge.
-        guard let credential = try await store.credential(for: username), auth.expires > now() else {
-            throw OAuthFailure(code: "access_denied")
-        }
+        let existing = try await store.credential(for: username)
+        let registering = body["mode"] as? String == "register"
+        if registering && existing != nil { throw OAuthFailure(code: "access_denied") }
+        if !registering && existing == nil { throw OAuthFailure(code: "access_denied") }
         auth.username = username
-        auth.passkeyChallenge = randomBytes(count: 32)
-        pending[tx] = auth
-        return try json(["challenge": Base64URL.encode(auth.passkeyChallenge!), "rpId": service.relyingPartyID,
-                         "allowCredentials": [["type": "public-key", "id": Base64URL.encode(credential.credentialID)]],
-                         "userVerification": "required", "timeout": 60000])
+        let challenge = randomBytes(count: 32)
+        auth.passkeyChallenge = challenge
+        if registering { auth.registrationUserID = randomBytes(count: 32) }
+        let replacement = try GrantRecord(key: record.key, value: auth, expires: auth.expires)
+        guard try await grants.transact(expected: [record], putting: [replacement], deleting: [], now: now()) else {
+            throw OAuthFailure(code: "invalid_request")
+        }
+        if let userID = auth.registrationUserID {
+            return try json(["challenge": Base64URL.encode(challenge),
+                "rp": ["id": service.relyingPartyID, "name": service.relyingPartyName],
+                "user": ["id": Base64URL.encode(userID), "name": username, "displayName": username],
+                "pubKeyCredParams": [["type": "public-key", "alg": -7]], "attestation": "none",
+                "authenticatorSelection": ["userVerification": "required"], "timeout": 60000])
+        }
+        return try json(["challenge": Base64URL.encode(challenge), "rpId": service.relyingPartyID,
+            "allowCredentials": [["type": "public-key", "id": Base64URL.encode(existing!.credentialID)]],
+            "userVerification": "required", "timeout": 60000])
+    }
+
+    private func consumeLogin(_ record: GrantRecord) async throws -> Authorization {
+        guard try await grants.transact(expected: [record], putting: [], deleting: [record.key], now: now()) else {
+            throw OAuthFailure(code: "invalid_request")
+        }
+        return try record.decode(Authorization.self)
+    }
+
+    private func validClientData(_ encoded: String, type: String) -> Bool {
+        guard let data = try? Base64URL.decode(encoded), let object = try? jsonObject(from: data) else { return false }
+        return object["origin"] as? String == configuration.issuer && object["type"] as? String == type && object["crossOrigin"] as? Bool != true
     }
 
     private func completeLogin(_ request: HTTPRequestAccumulator) async throws -> HTTPResponsePayload {
-        let (tx, body) = try loginBody(request)
-        guard let auth = pending.removeValue(forKey: tx), let username = auth.username,
-              let challenge = auth.passkeyChallenge, let object = body["credential"],
-              let data = try? JSONSerialization.data(withJSONObject: object),
+        let (record, body) = try await loginBody(request)
+        let auth = try await consumeLogin(record)
+        guard auth.registrationUserID == nil, let username = auth.username, let challenge = auth.passkeyChallenge,
+              let object = body["credential"], let data = try? JSONSerialization.data(withJSONObject: object),
               let assertion = try? JSONDecoder().decode(AssertionCredential.self, from: data),
-              let stored = try await store.credential(for: username) else { throw OAuthFailure(code: "access_denied") }
-        // OIDC requires the exact configured origin and user verification, even if the legacy verifier permits omission.
-        guard let clientData = try? Base64URL.decode(assertion.clientDataJSON),
-              let clientObject = try? jsonObject(from: clientData), clientObject["origin"] as? String == configuration.issuer,
-              clientObject["crossOrigin"] as? Bool != true,
+              let stored = try await store.credential(for: username),
+              validClientData(assertion.clientDataJSON, type: "webauthn.get"),
               let authData = try? Base64URL.decode(assertion.authenticatorData), authData.count >= 37,
-              authData[32] & 0x04 != 0, assertion.type == "public-key", auth.expires > now() else {
-            throw OAuthFailure(code: "access_denied")
-        }
+              authData[32] & 0x04 != 0, assertion.type == "public-key" else { throw OAuthFailure(code: "access_denied") }
         let result: AssertionResult
         do {
             result = try verifier.verifyAssertion(credential: assertion, storedCredential: stored, expectedChallenge: challenge, config: service)
         } catch { throw OAuthFailure(code: "access_denied") }
         try await store.updateSignCount(username: username, signCount: result.newSignCount)
-        guard auth.expires > now() else { throw OAuthFailure(code: "access_denied") }
-        let code = randomToken()
-        codes[hash(code)] = Grant(authorization: auth, subject: Base64URL.encode(stored.userID), username: username,
-            authTime: Int(now().timeIntervalSince1970), family: randomToken(), expires: now().addingTimeInterval(60))
-        let url = try redirectURL(auth.redirectURI, values: ["code": code, "state": auth.state, "iss": configuration.issuer])
-        return try json(["redirect": url])
+        return try await finishAuthorization(auth, credential: stored)
     }
 
-    private func token(_ request: HTTPRequestAccumulator) throws -> HTTPResponsePayload {
+    private func completeRegistration(_ request: HTTPRequestAccumulator) async throws -> HTTPResponsePayload {
+        let (record, body) = try await loginBody(request)
+        let auth = try await consumeLogin(record)
+        guard let username = auth.username, let challenge = auth.passkeyChallenge, let userID = auth.registrationUserID,
+              let object = body["credential"], let data = try? JSONSerialization.data(withJSONObject: object),
+              let credential = try? JSONDecoder().decode(RegistrationCredential.self, from: data), credential.type == "public-key",
+              validClientData(credential.clientDataJSON, type: "webauthn.create") else { throw OAuthFailure(code: "access_denied") }
+        let result: AttestationResult
+        do {
+            let attestation = try Base64URL.decode(credential.attestationObject)
+            var reader = CBORReader(data: attestation)
+            let map = try reader.readValue().mapValue()
+            guard let bytes = try map[.text("authData")]?.byteStringValue(), bytes.count >= 37, bytes[32] & 0x04 != 0 else {
+                throw OAuthFailure(code: "access_denied")
+            }
+            result = try verifier.parseAttestation(attestationObject: attestation,
+                clientDataJSON: Base64URL.decode(credential.clientDataJSON), expectedChallenge: challenge, config: service)
+            guard credential.rawID == Base64URL.encode(result.credentialID), credential.id == credential.rawID else {
+                throw OAuthFailure(code: "access_denied")
+            }
+        } catch { throw OAuthFailure(code: "access_denied") }
+        let stored = StoredCredential(credentialID: result.credentialID, username: username, userID: userID,
+            publicKeyX963: result.publicKeyX963, signCount: result.signCount)
+        try await store.saveCredential(stored)
+        return try await finishAuthorization(auth, credential: stored)
+    }
+
+    private func finishAuthorization(_ auth: Authorization, credential: StoredCredential) async throws -> HTTPResponsePayload {
+        guard auth.expires > now() else { throw OAuthFailure(code: "access_denied") }
+        let code = randomToken()
+        let grant = Grant(authorization: auth, subject: Base64URL.encode(credential.userID), username: credential.username,
+            authTime: Int(now().timeIntervalSince1970), family: randomToken(), expires: now().addingTimeInterval(60))
+        let record = try GrantRecord(key: "code#" + hash(code), value: grant, expires: grant.expires)
+        guard try await grants.transact(expected: [], putting: [record], deleting: [], now: now()) else {
+            throw OAuthFailure(code: "temporarily_unavailable")
+        }
+        return try json(["redirect": redirectURL(auth.redirectURI, values: ["code": code, "state": auth.state, "iss": configuration.issuer])])
+    }
+
+    private func token(_ request: HTTPRequestAccumulator) async throws -> HTTPResponsePayload {
         let p = try form(request)
         guard request.headers["Authorization"].isEmpty, p["client_secret"] == nil,
               let clientID = p["client_id"], configuration.clients.contains(where: { $0.clientID == clientID }) else {
@@ -213,83 +273,107 @@ actor OIDCProvider {
         }
         switch p["grant_type"] {
         case "authorization_code":
-            guard let code = p["code"], let grant = codes[hash(code)], grant.expires > now(),
-                  grant.authorization.clientID == clientID, p["redirect_uri"] == grant.authorization.redirectURI,
+            guard let code = p["code"], let record = try await grants.get("code#" + hash(code), now: now()) else {
+                throw OAuthFailure(code: "invalid_grant")
+            }
+            let grant = try record.decode(Grant.self)
+            guard grant.authorization.clientID == clientID, p["redirect_uri"] == grant.authorization.redirectURI,
                   let verifier = p["code_verifier"], Self.validVerifier(verifier),
                   Base64URL.encode(Data(verifier.utf8).sha256()) == grant.authorization.challenge else {
                 throw OAuthFailure(code: "invalid_grant")
             }
-            codes.removeValue(forKey: hash(code))
-            return try issue(grant, refreshExpiry: now().addingTimeInterval(30 * 86400), includeNonce: true)
+            return try await issue(grant, consumed: record, family: nil, refreshExpiry: now().addingTimeInterval(30 * 86400), includeNonce: true)
         case "refresh_token":
-            guard let token = p["refresh_token"], let record = refresh[hash(token)], record.grant.expires > now(),
-                  record.grant.authorization.clientID == clientID else { throw OAuthFailure(code: "invalid_grant") }
-            if record.used || revoked.contains(record.grant.family) {
-                revoked.insert(record.grant.family)
+            guard let token = p["refresh_token"], let record = try await grants.get("refresh#" + hash(token), now: now()) else {
                 throw OAuthFailure(code: "invalid_grant")
             }
-            if let scope = p["scope"], Set(scope.split(separator: " ").map(String.init)) != record.grant.authorization.scope {
+            let refresh = try record.decode(RefreshRecord.self)
+            guard refresh.grant.authorization.clientID == clientID else { throw OAuthFailure(code: "invalid_grant") }
+            guard let family = try await grants.get("family#" + refresh.grant.family, now: now()) else { throw OAuthFailure(code: "invalid_grant") }
+            let familyState = try family.decode(TokenFamily.self)
+            if refresh.used || familyState.revoked {
+                try await revokeFamily(refresh.grant.family)
+                throw OAuthFailure(code: "invalid_grant")
+            }
+            if let scope = p["scope"], Set(scope.split(separator: " ").map(String.init)) != refresh.grant.authorization.scope {
                 throw OAuthFailure(code: "invalid_scope")
             }
-            refresh[hash(token)]?.used = true
-            return try issue(record.grant, refreshExpiry: record.grant.expires, includeNonce: false)
+            return try await issue(refresh.grant, consumed: record, family: family, refreshExpiry: refresh.grant.expires, includeNonce: false)
         default: throw OAuthFailure(code: "unsupported_grant_type")
         }
     }
 
-    private func issue(_ grant: Grant, refreshExpiry: Date, includeNonce: Bool) throws -> HTTPResponsePayload {
-        guard access.count + refresh.count < 50000 else { throw OAuthFailure(code: "temporarily_unavailable") }
+    private func issue(_ grant: Grant, consumed: GrantRecord, family: GrantRecord?, refreshExpiry: Date, includeNonce: Bool) async throws -> HTTPResponsePayload {
         let timestamp = Int(now().timeIntervalSince1970)
         var claims: [String: Any] = ["iss": configuration.issuer, "sub": grant.subject,
             "aud": grant.authorization.clientID, "iat": timestamp, "exp": timestamp + 600, "auth_time": grant.authTime]
         if includeNonce, let nonce = grant.authorization.nonce { claims["nonce"] = nonce }
         let accessToken = randomToken()
         let idToken = try OIDCSigner(configuration: configuration).sign(claims)
-        access[hash(accessToken)] = copy(grant, expires: now().addingTimeInterval(600))
+        let familyExpiry = family?.expires ?? refreshExpiry
+        var writes = [try GrantRecord(key: "access#" + hash(accessToken), value: copy(grant, expires: now().addingTimeInterval(600)), expires: now().addingTimeInterval(600)),
+            try GrantRecord(key: "family#" + grant.family, value: TokenFamily(), expires: familyExpiry)]
         var body: [String: Any] = ["access_token": accessToken, "token_type": "Bearer", "expires_in": 600,
             "id_token": idToken, "scope": grant.authorization.scope.sorted().joined(separator: " ")]
         if grant.authorization.scope.contains("offline_access") {
             let refreshToken = randomToken()
-            refresh[hash(refreshToken)] = RefreshRecord(grant: copy(grant, expires: refreshExpiry))
+            writes.append(try GrantRecord(key: "refresh#" + hash(refreshToken), value: RefreshRecord(grant: copy(grant, expires: refreshExpiry)), expires: refreshExpiry))
             body["refresh_token"] = refreshToken
+        }
+        if family != nil {
+            writes.append(try GrantRecord(key: consumed.key, value: RefreshRecord(grant: grant, used: true), expires: consumed.expires))
+        }
+        let expected = [consumed] + (family.map { [$0] } ?? [])
+        guard try await grants.transact(expected: expected, putting: writes, deleting: family == nil ? [consumed.key] : [], now: now()) else {
+            // A competing refresh may have consumed the old token. Revocation is shared and survives restart.
+            if family != nil { try await revokeFamily(grant.family) }
+            throw OAuthFailure(code: "invalid_grant")
         }
         return try json(body)
     }
 
-    private func userInfo(_ request: HTTPRequestAccumulator) throws -> HTTPResponsePayload {
+    private func userInfo(_ request: HTTPRequestAccumulator) async throws -> HTTPResponsePayload {
         guard let header = request.headers["Authorization"].first, header.lowercased().hasPrefix("bearer "),
-              let grant = access[hash(String(header.dropFirst(7)))], grant.expires > now(), !revoked.contains(grant.family) else {
+              let record = try await grants.get("access#" + hash(String(header.dropFirst(7))), now: now()) else {
             throw OAuthFailure(code: "invalid_token")
         }
+        let grant = try record.decode(Grant.self)
+        guard let family = try await grants.get("family#" + grant.family, now: now()),
+              !(try family.decode(TokenFamily.self)).revoked else { throw OAuthFailure(code: "invalid_token") }
         var body = ["sub": grant.subject]
         if grant.authorization.scope.contains("profile") { body["preferred_username"] = grant.username }
         return try json(body)
     }
 
-    private func revoke(_ request: HTTPRequestAccumulator) throws -> HTTPResponsePayload {
+    private func revoke(_ request: HTTPRequestAccumulator) async throws -> HTTPResponsePayload {
         let p = try form(request)
         guard let client = p["client_id"], configuration.clients.contains(where: { $0.clientID == client }),
               request.headers["Authorization"].isEmpty, p["client_secret"] == nil, let token = p["token"] else {
             throw OAuthFailure(code: "invalid_request")
         }
-        let key = hash(token)
-        if let grant = refresh[key]?.grant ?? access[key], grant.authorization.clientID == client { revoked.insert(grant.family) }
+        if let record = try await grants.get("refresh#" + hash(token), now: now()) {
+            let grant = try record.decode(RefreshRecord.self).grant
+            if grant.authorization.clientID == client { try await revokeFamily(grant.family) }
+        } else if let record = try await grants.get("access#" + hash(token), now: now()) {
+            let grant = try record.decode(Grant.self)
+            if grant.authorization.clientID == client { try await revokeFamily(grant.family) }
+        }
         return HTTPResponsePayload(status: .ok, headers: ["Cache-Control": "no-store"], body: Data())
+    }
+
+    private func revokeFamily(_ key: String) async throws {
+        for _ in 0..<8 {
+            guard let record = try await grants.get("family#" + key, now: now()) else { return }
+            if try record.decode(TokenFamily.self).revoked { return }
+            let revoked = try GrantRecord(key: record.key, value: TokenFamily(revoked: true), expires: record.expires)
+            if try await grants.transact(expected: [record], putting: [revoked], deleting: [], now: now()) { return }
+        }
+        throw OAuthFailure(code: "temporarily_unavailable")
     }
 
     private func copy(_ grant: Grant, expires: Date) -> Grant {
         Grant(authorization: grant.authorization, subject: grant.subject, username: grant.username,
               authTime: grant.authTime, family: grant.family, expires: expires)
-    }
-
-    private func cleanup() {
-        let date = now()
-        pending = pending.filter { $0.value.expires > date }
-        codes = codes.filter { $0.value.expires > date }
-        access = access.filter { $0.value.expires > date }
-        refresh = refresh.filter { $0.value.grant.expires > date }
-        let families = Set(access.values.map(\.family) + refresh.values.map { $0.grant.family })
-        revoked.formIntersection(families)
     }
 
     private func form(_ request: HTTPRequestAccumulator) throws -> [String: String] {
